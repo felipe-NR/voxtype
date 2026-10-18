@@ -353,6 +353,48 @@ voxtype setup --download --model <model-name>
 
 Setup skips the compile when the model's cache blob already exists, so rerunning after a successful compile is cheap.
 
+### AMD NPU: "Resource temporarily unavailable" or "err=-11" when the NPU encoder loads
+
+**Cause:** XRT maps every NPU buffer with `MAP_LOCKED`, and the kernel checks each mapping against `RLIMIT_MEMLOCK`. The default limit is 8 MiB; large-v3-turbo's largest buffer is 90 MiB, so the pack asks for 128 MiB.
+
+**Solution:** Check the limit the daemon sees and what the pack needs:
+
+```bash
+voxtype setup npu --status
+```
+
+Raise it for your user session (as root), then log out and back in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nLimitMEMLOCK=134217728\n' | sudo tee /etc/systemd/system/user@.service.d/voxtype-npu.conf
+```
+
+To apply it without logging out, also raise the running user manager's limit with `sudo prlimit --pid $(pgrep -u $USER -x systemd | head -1) --memlock=134217728:134217728`, then add `LimitMEMLOCK=134217728` to the voxtype unit (e.g. in `~/.config/systemd/user/voxtype.service.d/npu.conf`) and restart it.
+
+### AMD NPU: "The NPU has no free hardware context" (CREATE_HWCTX err=-22)
+
+**Cause:** XDNA1 has a small, device-wide number of hardware contexts. Another process already holds them: a containerized NPU speech-to-text service, another NPU application, or a second voxtype daemon.
+
+**Solution:** Stop the other process (for a container: `docker stop <name>`, plus `docker update --restart=no <name>` so it doesn't come back), then restart voxtype.
+
+### AMD NPU: "libvoxtype_xrt.so not found" or "cannot load"
+
+**Cause:** The NPU encoder reaches XRT through a small shim library that is built separately from voxtype.
+
+**Solution:** Build it into the default location from the voxtype source tree, or point `[whisper] npu_shim` at it:
+
+```bash
+docker build -f xdna-shim/Dockerfile \
+  --output type=local,dest=$HOME/.local/lib/voxtype/xdna xdna-shim
+```
+
+### AMD NPU: "pack ... is for ..., but the model has ..."
+
+**Cause:** A kernel pack is compiled for one encoder geometry, e.g. large-v3-turbo's 32 layers of width 1280. A different model needs its own pack.
+
+**Solution:** Use the pack that matches `[whisper] model`, or switch the model to the one the pack was built for. `voxtype setup npu --status` shows which pack voxtype would use.
+
 ### Voxtype crashes during transcription (Linux)
 
 **Cause:** On some Linux systems (particularly with glibc 2.42+ like Ubuntu 25.10), the whisper-rs FFI bindings crash due to C++ exceptions crossing the FFI boundary.

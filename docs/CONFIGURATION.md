@@ -1246,6 +1246,74 @@ cmake --build build --config Release
 sudo cp build/bin/whisper-cli /usr/local/bin/
 ```
 
+### encoder_device
+
+**Type:** String (`"default"` or `"npu"`)
+**Default:** `"default"`
+**Required:** No
+**Platform:** Linux, AMD Ryzen AI (XDNA1) NPUs
+
+Where the Whisper encoder runs. `"default"` is whisper.cpp's own encoder, on whatever GPU or CPU backend the build uses. `"npu"` runs the encoder on the AMD XDNA NPU, while whisper.cpp keeps the decoder, language detection and timestamps on the CPU. The iGPU stays idle.
+
+Only applies to `mode = "local"`. It needs a voxtype built with `--features xdna-npu`, a kernel pack for your model (see [npu_pack](#npu_pack)) and `libvoxtype_xrt.so` (see [npu_shim](#npu_shim)). The encoder weights come from the same ggml model file whisper.cpp loads, in f16 or q8_0.
+
+On the NPU, the encoder context follows the kernel pack's ladder (512, 768, 1024, 1280 or 1500 positions, picked from the clip length), not `context_window_optimization`.
+
+**Example:**
+```toml
+[whisper]
+model = "large-v3-turbo"
+encoder_device = "npu"
+```
+
+**CLI:** `--encoder-device npu`
+**Environment:** `VOXTYPE_ENCODER_DEVICE=npu`
+
+`voxtype setup npu --status` checks the driver, XRT, the shim, the pack and the locked-memory limit. `voxtype setup npu --enable` sets this option.
+
+**Locked memory:** XRT locks every NPU buffer in memory, and the kernel checks each mapping against `RLIMIT_MEMLOCK`. large-v3-turbo needs 128 MiB per mapping, and the default limit is 8 MiB. Raise it for your user session (as root), then log out and back in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nLimitMEMLOCK=134217728\n' | sudo tee /etc/systemd/system/user@.service.d/voxtype-npu.conf
+```
+
+Only one process can hold the NPU's hardware contexts at a time. Stop other NPU services while voxtype uses it.
+
+### npu_pack
+
+**Type:** String (directory path, `~` allowed)
+**Default:** The newest `<model>-xdna*` directory under `~/.local/share/voxtype/models/npu-packs/`
+**Required:** No
+
+The kernel pack for `encoder_device = "npu"`: the compiled NPU overlays for one encoder geometry, plus a `manifest.json`. A pack fits any ggml model of the same architecture, so fine-tunes are included. Voxtype checks every file's size and sha256 against the manifest at load, and refuses a model whose encoder hyperparameters don't match the pack.
+
+**Example:**
+```toml
+[whisper]
+encoder_device = "npu"
+npu_pack = "~/npu-packs/large-v3-turbo-xdna1-5be736d256ac"
+```
+
+**CLI:** `--npu-pack DIR`
+**Environment:** `VOXTYPE_NPU_PACK=DIR`
+
+### npu_shim
+
+**Type:** String (file path, `~` allowed)
+**Default:** `~/.local/lib/voxtype/xdna/lib/x86_64-linux-gnu/libvoxtype_xrt.so`, then `/usr/lib/voxtype/xdna/lib/x86_64-linux-gnu/libvoxtype_xrt.so`
+**Required:** No
+
+The XRT shim for `encoder_device = "npu"`. Voxtype loads it at run time, only when the NPU is selected, so no voxtype binary links XRT. Build it, together with the XRT runtime libraries it needs, from the voxtype source tree:
+
+```bash
+docker build -f xdna-shim/Dockerfile \
+  --output type=local,dest=$HOME/.local/lib/voxtype/xdna xdna-shim
+```
+
+**CLI:** `--npu-shim PATH`
+**Environment:** `VOXTYPE_NPU_SHIM=PATH`
+
 ---
 
 ## [streaming]

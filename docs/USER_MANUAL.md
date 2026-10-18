@@ -910,6 +910,20 @@ Whisper is OpenAI's speech recognition model, running locally via whisper.cpp. I
 
 This is the recommended engine for most users.
 
+#### Whisper on an AMD Ryzen AI NPU
+
+On AMD XDNA1 NPUs (Ryzen 7040/8040 "Phoenix"/"Hawk Point" laptops and the Ryzen 7 8700G / Ryzen 5 8600G desktop APUs), the Whisper encoder can run on the NPU with `[whisper] encoder_device = "npu"`. The decoder stays on the CPU. Text is the same as with whisper.cpp's own encoder at the same context size.
+
+On a Ryzen 7 8700G with large-v3-turbo, a 6 s phrase takes about 1.5 s end to end and an 11 s phrase about 2.4 s. The Vulkan iGPU is faster on longer clips. The NPU uses less energy per short phrase and leaves the iGPU free.
+
+```bash
+voxtype setup npu --status   # driver, XRT, shim, kernel pack, locked memory
+voxtype setup npu --enable   # sets encoder_device = "npu"
+systemctl --user restart voxtype
+```
+
+See [encoder_device](CONFIGURATION.md#encoder_device) for the requirements. You need the `xdna-npu` build feature, a kernel pack for the model, the `libvoxtype_xrt.so` shim, and a locked-memory limit of 128 MiB.
+
 ### Parakeet
 
 Parakeet is NVIDIA's FastConformer-based ASR model. It offers:
