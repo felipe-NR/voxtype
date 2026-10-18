@@ -17,8 +17,10 @@ pub const RUN_TIMEOUT_MS: u32 = 10_000;
 struct Overlay {
     xclbin: super::shim::Xclbin,
     kernel_name: String,
-    insts: Bo,
-    n_insts: usize,
+    words: Vec<u32>,
+    /// Uploaded the first time a context opens the overlay, in the memory
+    /// group its kernel reports for the instruction argument.
+    insts: Option<Bo>,
     gemm: bool,
 }
 
@@ -47,7 +49,6 @@ pub struct Runtime {
     max_ctx: usize,
     gemm_groups: Vec<i32>,
     rowop_groups: Vec<i32>,
-    insts_group: i32,
     pub ctx_creates: usize,
 }
 
@@ -59,7 +60,7 @@ impl Runtime {
     /// Register every overlay of the pack and upload its instruction stream.
     pub fn new(dev: Device, pack: &Pack) -> Result<Self, TranscribeError> {
         let m = &pack.manifest;
-        let mut overlays = HashMap::new();
+        let mut loaded = Vec::new();
         for name in pack.designs_in_order() {
             let d: &Design = &m.designs[&name];
             let xclbin = dev.load_xclbin(&pack.file(&d.xclbin))?;
@@ -70,36 +71,62 @@ impl Runtime {
                     name, kernel_name, d.kernel
                 )));
             }
-            let words = std::fs::read(pack.file(&d.insts))
+            let bytes = std::fs::read(pack.file(&d.insts))
                 .map_err(|e| fail(format!("{}: {}", d.insts.path, e)))?;
-            if words.len() % 4 != 0 || words.is_empty() {
+            if bytes.len() % 4 != 0 || bytes.is_empty() {
                 return Err(fail(format!("{}: not a uint32 stream", d.insts.path)));
             }
-            let mut insts = dev.alloc(words.len(), BO_CACHEABLE, m.abi.insts_group_id)?;
-            for (dst, src) in insts.as_u32_mut().iter_mut().zip(words.chunks_exact(4)) {
-                *dst = u32::from_le_bytes(src.try_into().unwrap());
-            }
-            insts.to_device()?;
-            overlays.insert(
-                name.clone(),
-                Overlay {
-                    xclbin,
-                    kernel_name,
-                    insts,
-                    n_insts: words.len() / 4,
-                    gemm: d.kind == "gemm",
-                },
-            );
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            loaded.push((name, xclbin, kernel_name, words, d.kind == "gemm"));
         }
+
+        // XRT encodes memory groups (65536 for a kernel's argument 3, not the
+        // 3 the manifest lists), so operand buffers are allocated in the
+        // groups one kernel of each kind reports. A host_only buffer is not
+        // tied to that kernel: it feeds kernels of other overlays too
+        // (measured in whisper-xdna, probe_bo_share.py).
+        let probe = |gemm: bool, n: usize| -> Result<Vec<i32>, TranscribeError> {
+            let (name, xclbin, kernel_name, ..) = loaded
+                .iter()
+                .find(|l| l.4 == gemm)
+                .ok_or_else(|| fail("the pack has no design of a required kind"))?;
+            let ctx = dev.hwctx(xclbin)?;
+            let k = ctx.kernel(kernel_name)?;
+            let groups = (0..n)
+                .map(|i| k.group_id(3 + i as i32))
+                .collect::<Result<Vec<_>, _>>()?;
+            tracing::debug!("NPU: {} memory groups {:?}", name, groups);
+            Ok(groups)
+        };
+        let gemm_groups = probe(true, m.abi.gemm.group_ids.len())?;
+        let rowop_groups = probe(false, m.abi.rowop.group_ids.len())?;
+
+        let overlays = loaded
+            .into_iter()
+            .map(|(name, xclbin, kernel_name, words, gemm)| {
+                (
+                    name,
+                    Overlay {
+                        xclbin,
+                        kernel_name,
+                        words,
+                        insts: None,
+                        gemm,
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             dev,
             overlays,
             live: Vec::new(),
             clock: 0,
             max_ctx: m.device.max_hw_contexts,
-            gemm_groups: m.abi.gemm.group_ids.clone(),
-            rowop_groups: m.abi.rowop.group_ids.clone(),
-            insts_group: m.abi.insts_group_id,
+            gemm_groups,
+            rowop_groups,
             ctx_creates: 0,
         })
     }
@@ -131,34 +158,17 @@ impl Runtime {
         }
         let ov = self
             .overlays
-            .get(name)
+            .get_mut(name)
             .ok_or_else(|| fail(format!("design {} not loaded", name)))?;
         let ctx = self.dev.hwctx(&ov.xclbin)?;
         let kernel = ctx.kernel(&ov.kernel_name)?;
-        // The group ids in the manifest are assertions about the toolchain the
-        // overlays came from; a mismatch means pack and runtime have drifted.
-        let want: &[i32] = if ov.gemm {
-            &self.gemm_groups
-        } else {
-            &self.rowop_groups
-        };
-        for (i, &g) in want.iter().enumerate() {
-            let got = kernel.group_id(3 + i as i32)?;
-            if got != g {
-                return Err(fail(format!(
-                    "{}: argument {} is in memory group {}, the pack says {}",
-                    name,
-                    3 + i,
-                    got,
-                    g
-                )));
-            }
-        }
-        if kernel.group_id(1)? != self.insts_group {
-            return Err(fail(format!(
-                "{}: instruction buffer group differs from the pack's",
-                name
-            )));
+        if ov.insts.is_none() {
+            let mut insts =
+                self.dev
+                    .alloc(ov.words.len() * 4, BO_CACHEABLE, kernel.group_id(1)?)?;
+            insts.as_u32_mut().copy_from_slice(&ov.words);
+            insts.to_device()?;
+            ov.insts = Some(insts);
         }
         self.ctx_creates += 1;
         self.live.push(Live {
@@ -175,7 +185,8 @@ impl Runtime {
     pub fn start(&mut self, name: &str, bufs: &[&Bo]) -> Result<Run, TranscribeError> {
         let i = self.slot(name)?;
         let ov = &self.overlays[name];
-        self.live[i].kernel.start(&ov.insts, ov.n_insts, bufs)
+        let insts = ov.insts.as_ref().expect("uploaded when the context opened");
+        self.live[i].kernel.start(insts, ov.words.len(), bufs)
     }
 
     /// Run and wait.
@@ -196,11 +207,12 @@ impl Runtime {
         if fresh {
             self.live[i].runlist = None;
             let ov = &self.overlays[name];
+            let insts = ov.insts.as_ref().expect("uploaded when the context opened");
             let live = &self.live[i];
             let list = live._ctx.runlist()?;
             let mut runs = Vec::with_capacity(args.len());
             for a in args {
-                let r = live.kernel.bind(&ov.insts, ov.n_insts, a)?;
+                let r = live.kernel.bind(insts, ov.words.len(), a)?;
                 list.add(&r)?;
                 runs.push(r);
             }
