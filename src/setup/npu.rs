@@ -246,6 +246,37 @@ mod amd {
     use crate::config::{Config, EncoderDevice};
     use std::path::{Path, PathBuf};
 
+    /// Where prebuilt kernel packs are published. FORK ONLY: a release of
+    /// felipe-NR/voxtype; upstream would serve packs from the model CDN.
+    const PACK_RELEASE: &str =
+        "https://github.com/felipe-NR/voxtype/releases/download/xdna-packs-1";
+
+    /// The published pack for a model, if there is one.
+    fn published_pack(model: &str) -> Option<&'static str> {
+        match model {
+            "large-v3-turbo" => Some("large-v3-turbo-xdna1-5be736d256ac"),
+            "tiny" => Some("tiny-xdna1-f25314b6f4eb"),
+            _ => None,
+        }
+    }
+
+    /// How to install the pack for `model`, or why there is none.
+    fn pack_hint(model: &str) -> String {
+        let root = Config::models_dir().join("npu-packs");
+        match published_pack(model) {
+            Some(id) => format!(
+                "Download it:\n         mkdir -p {root}\n         \
+                 curl -L {PACK_RELEASE}/{id}.tar.gz | tar -xz -C {root}",
+                root = root.display()
+            ),
+            None => format!(
+                "No published pack for {}; packs exist for large-v3-turbo and tiny.\n         \
+                 Other models need one exported with whisper-xdna (tools/export_pack.py).",
+                model
+            ),
+        }
+    }
+
     fn read_sys(p: &str) -> Option<String> {
         std::fs::read_to_string(p)
             .ok()
@@ -405,6 +436,7 @@ mod amd {
                     config.whisper.model,
                     Config::models_dir().join("npu-packs").display()
                 ));
+                print_info(&pack_hint(&config.whisper.model));
             }
         }
 
@@ -449,9 +481,10 @@ mod amd {
             .ok_or_else(|| anyhow::anyhow!("Could not determine config path"))?;
         let pack = configured_pack(&config).ok_or_else(|| {
             anyhow::anyhow!(
-                "No kernel pack for model {}. Put one under {} or set [whisper] npu_pack.",
+                "No kernel pack for model {} under {} (or set [whisper] npu_pack).\n  {}",
                 config.whisper.model,
-                Config::models_dir().join("npu-packs").display()
+                Config::models_dir().join("npu-packs").display(),
+                pack_hint(&config.whisper.model).replace("         ", "  ")
             )
         })?;
         crate::config_set::set_key(path.clone(), "whisper.encoder_device", "npu")?;
@@ -495,6 +528,19 @@ mod amd {
             assert!(generation("1022:1502").starts_with("XDNA1"));
             assert!(generation("1022:17f0").starts_with("XDNA2"));
             assert_eq!(generation("8086:7d1d"), "unknown XDNA");
+        }
+
+        #[test]
+        fn published_packs_match_the_committed_manifests() {
+            for model in ["large-v3-turbo", "tiny"] {
+                let id = published_pack(model).unwrap();
+                let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/xdna")
+                    .join(id)
+                    .join("manifest.json");
+                assert!(manifest.is_file(), "{}", manifest.display());
+            }
+            assert!(published_pack("base.en").is_none());
         }
 
         #[test]
