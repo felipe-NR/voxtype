@@ -80,6 +80,9 @@ pub mod cohere_fbank;
 #[cfg(feature = "openvino-whisper")]
 pub mod openvino_whisper;
 
+#[cfg(feature = "xdna-npu")]
+pub mod xdna;
+
 #[cfg(feature = "openvino-whisper")]
 use crate::config::OpenVinoConfig;
 use crate::config::{Config, StreamingConfig, TranscriptionEngine, WhisperConfig, WhisperMode};

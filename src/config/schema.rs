@@ -202,6 +202,7 @@ pub fn feature_compiled(feature: &str) -> bool {
 const ENGINE_CHOICES: &[&str] = crate::config_set::ENGINE_NAMES;
 
 const WHISPER_MODE_CHOICES: &[&str] = &["local", "remote", "cli"];
+const ENCODER_DEVICE_CHOICES: &[&str] = &["default", "npu"];
 const WHISPER_LANG_CHOICES: &[&str] = &[
     "auto", "en", "fr", "de", "it", "es", "pt", "nl", "pl", "zh", "ja", "ko", "ru", "ar",
 ];
@@ -1786,6 +1787,36 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_engine("whisper"),
     spec(
+        "whisper.encoder_device",
+        "whisper",
+        "encoder_device",
+        closed(ENCODER_DEVICE_CHOICES),
+        "Advanced",
+        "Encoder device",
+        "Where the encoder runs: whisper.cpp's own (default) or the AMD XDNA NPU (npu). Local mode only.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.npu_pack",
+        "whisper",
+        "npu_pack",
+        KeyType::String,
+        "Advanced",
+        "NPU kernel pack",
+        "Kernel pack directory for the NPU encoder. Unset looks in <models>/npu-packs.",
+    )
+    .for_engine("whisper"),
+    spec(
+        "whisper.npu_shim",
+        "whisper",
+        "npu_shim",
+        KeyType::String,
+        "Advanced",
+        "NPU XRT shim",
+        "Path to libvoxtype_xrt.so. Unset looks in ~/.local/lib/voxtype/xdna and /usr/lib/voxtype/xdna.",
+    )
+    .for_engine("whisper"),
+    spec(
         "whisper.whisper_cli_path",
         "whisper",
         "whisper_cli_path",
@@ -2673,6 +2704,9 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "whisper.remote_timeout_secs" => json!(cfg.whisper.remote_timeout_secs),
         "whisper.remote_send_auto_language" => json!(cfg.whisper.remote_send_auto_language),
         "whisper.whisper_cli_path" => opt_str(cfg.whisper.whisper_cli_path.as_ref()),
+        "whisper.encoder_device" => json!(serde_json::to_value(cfg.whisper.encoder_device).ok()?),
+        "whisper.npu_pack" => opt_str(cfg.whisper.npu_pack.as_ref()),
+        "whisper.npu_shim" => opt_str(cfg.whisper.npu_shim.as_ref()),
         "whisper.max_loaded_models" => json!(cfg.whisper.max_loaded_models),
         "whisper.cold_model_timeout_secs" => json!(cfg.whisper.cold_model_timeout_secs),
         "whisper.context_window_optimization" => json!(cfg.whisper.context_window_optimization),

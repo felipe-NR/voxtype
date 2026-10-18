@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 
 use super::{default_on_demand_loading, LanguageConfig};
 
+/// Where the Whisper encoder runs.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderDevice {
+    /// whisper.cpp's own encoder, on the GPU or CPU the build uses
+    #[default]
+    Default,
+    /// The AMD XDNA NPU (Ryzen AI). The decoder stays on the CPU.
+    /// Requires: cargo build --features xdna-npu, plus a kernel pack and
+    /// libvoxtype_xrt.so (see xdna-shim/)
+    Npu,
+}
+
 /// Whisper execution mode (how whisper runs)
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -238,6 +251,22 @@ pub struct WhisperConfig {
     /// Used when mode = "cli"
     #[serde(default)]
     pub whisper_cli_path: Option<String>,
+
+    // --- NPU encoder settings ---
+    /// Where the encoder runs: "default" (whisper.cpp) or "npu" (AMD XDNA).
+    /// Only applies to mode = "local".
+    #[serde(default)]
+    pub encoder_device: EncoderDevice,
+
+    /// Kernel pack directory for encoder_device = "npu". Unset looks for
+    /// <models dir>/npu-packs/<model>-xdna*.
+    #[serde(default)]
+    pub npu_pack: Option<String>,
+
+    /// Path to libvoxtype_xrt.so for encoder_device = "npu". Unset looks in
+    /// ~/.local/lib/voxtype/xdna and /usr/lib/voxtype/xdna.
+    #[serde(default)]
+    pub npu_shim: Option<String>,
 }
 
 impl WhisperConfig {
@@ -306,6 +335,9 @@ impl Default for WhisperConfig {
             remote_timeout_secs: None,
             remote_send_auto_language: false,
             whisper_cli_path: None,
+            encoder_device: EncoderDevice::Default,
+            npu_pack: None,
+            npu_shim: None,
         }
     }
 }

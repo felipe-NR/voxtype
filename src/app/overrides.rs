@@ -169,6 +169,17 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if cli.flash_attention {
         config.whisper.flash_attention = true;
     }
+    match cli.encoder_device.as_deref() {
+        Some("npu") => config.whisper.encoder_device = crate::config::EncoderDevice::Npu,
+        Some("default") => config.whisper.encoder_device = crate::config::EncoderDevice::Default,
+        _ => {}
+    }
+    if let Some(ref pack) = cli.npu_pack {
+        config.whisper.npu_pack = Some(pack.clone());
+    }
+    if let Some(ref shim) = cli.npu_shim {
+        config.whisper.npu_shim = Some(shim.clone());
+    }
     if cli.on_demand_loading {
         config.whisper.on_demand_loading = true;
     }

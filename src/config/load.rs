@@ -130,6 +130,22 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
             config.whisper.gpu_device = Some(n);
         }
     }
+    if let Ok(val) = std::env::var("VOXTYPE_ENCODER_DEVICE") {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "npu" => config.whisper.encoder_device = super::EncoderDevice::Npu,
+            "default" => config.whisper.encoder_device = super::EncoderDevice::Default,
+            other => tracing::warn!(
+                "Ignoring VOXTYPE_ENCODER_DEVICE={:?} (default or npu)",
+                other
+            ),
+        }
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_NPU_PACK") {
+        config.whisper.npu_pack = Some(val);
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_NPU_SHIM") {
+        config.whisper.npu_shim = Some(val);
+    }
     if let Ok(val) = std::env::var("VOXTYPE_FLASH_ATTENTION") {
         config.whisper.flash_attention = parse_bool_env(&val);
     }

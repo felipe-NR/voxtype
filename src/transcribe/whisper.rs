@@ -8,7 +8,7 @@
 //! - Constrained auto-detect: Detect from a user-specified subset of languages
 
 use super::Transcriber;
-use crate::config::{Config, LanguageConfig, WhisperConfig};
+use crate::config::{Config, EncoderDevice, LanguageConfig, WhisperConfig};
 use crate::error::TranscribeError;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -34,6 +34,10 @@ pub struct WhisperTranscriber {
     /// (since whisper-rs does not currently expose the chosen language
     /// from the full() pipeline). Read via [`Transcriber::last_detected_language`].
     last_language: Mutex<Option<String>>,
+    /// The AMD XDNA NPU encoder, when `encoder_device = "npu"`. Shared with
+    /// whisper.cpp through the encoder callback of every state.
+    #[cfg(feature = "xdna-npu")]
+    npu: Option<std::sync::Arc<super::xdna::XdnaEncoder>>,
 }
 
 impl WhisperTranscriber {
@@ -44,7 +48,21 @@ impl WhisperTranscriber {
         tracing::info!("Loading whisper model from {:?}", model_path);
         let start = std::time::Instant::now();
 
+        let use_npu = config.encoder_device == EncoderDevice::Npu;
+        #[cfg(not(feature = "xdna-npu"))]
+        if use_npu {
+            return Err(TranscribeError::InitFailed(
+                "encoder_device = \"npu\" needs a voxtype built with --features xdna-npu"
+                    .to_string(),
+            ));
+        }
+
         let mut ctx_params = WhisperContextParameters::default();
+        if use_npu {
+            // The NPU takes the encoder; the decoder runs on the CPU, so the
+            // iGPU stays idle (on an APU it shares the package power budget).
+            ctx_params.use_gpu(false);
+        }
         // An explicit gpu_device always wins. Otherwise, if the user asked for
         // a vendor with VOXTYPE_VULKAN_DEVICE, resolve that to an index and
         // set it: the loader hint alone has been observed not to take effect,
@@ -93,6 +111,13 @@ impl WhisperTranscriber {
 
         let threads = config.threads.unwrap_or_else(|| num_cpus::get().min(4));
 
+        #[cfg(feature = "xdna-npu")]
+        let npu = if use_npu {
+            Some(std::sync::Arc::new(load_npu_encoder(config, &model_path)?))
+        } else {
+            None
+        };
+
         Ok(Self {
             ctx,
             language: config.language.clone(),
@@ -101,7 +126,47 @@ impl WhisperTranscriber {
             context_window_optimization: config.context_window_optimization,
             initial_prompt: config.initial_prompt.clone(),
             last_language: Mutex::new(None),
+            #[cfg(feature = "xdna-npu")]
+            npu,
         })
+    }
+
+    /// The encoder context the NPU runs a clip at (a kernel pack ladder step),
+    /// or None when the NPU is not in use.
+    fn npu_audio_ctx(&self, duration_secs: f32) -> Option<i32> {
+        #[cfg(feature = "xdna-npu")]
+        if let Some(npu) = &self.npu {
+            return Some(npu.ctx_for_secs(duration_secs as f64) as i32);
+        }
+        let _ = duration_secs;
+        None
+    }
+
+    /// Route this state's encoder windows to the NPU, at the clip's ladder
+    /// step. Language detection then encodes the same window the
+    /// transcription will, and the NPU serves the second from its cache.
+    fn attach_npu(
+        &self,
+        state: &mut whisper_rs::WhisperState,
+        duration_secs: f32,
+    ) -> Result<(), TranscribeError> {
+        #[cfg(feature = "xdna-npu")]
+        if let Some(npu) = &self.npu {
+            let ctx = npu.ctx_for_secs(duration_secs as f64);
+            // SAFETY: the encoder is kept alive by self.npu for as long as
+            // any state of this transcriber exists, and it locks internally.
+            unsafe {
+                state.set_encoder_callback(
+                    Some(super::xdna::XdnaEncoder::callback),
+                    std::sync::Arc::as_ptr(npu) as *mut std::ffi::c_void,
+                );
+            }
+            state
+                .set_audio_ctx(ctx as i32)
+                .map_err(|e| TranscribeError::InferenceFailed(e.to_string()))?;
+        }
+        let _ = (state, duration_secs);
+        Ok(())
     }
 
     fn build_params<'a, 'b>(
@@ -154,8 +219,16 @@ impl WhisperTranscriber {
 
         // Context-window reduction speeds up the normal path. Keep retries at
         // the model's default context so a too-small window cannot repeat the
-        // same degenerate output.
-        if self.context_window_optimization && !retry {
+        // same degenerate output. On the NPU the context is a ladder step of
+        // the kernel pack instead.
+        if let Some(ctx) = self.npu_audio_ctx(duration_secs).filter(|_| !retry) {
+            params.set_audio_ctx(ctx);
+            tracing::debug!(
+                "NPU encoder: audio_ctx={} for {:.2}s clip",
+                ctx,
+                duration_secs
+            );
+        } else if self.context_window_optimization && !retry {
             if let Some(audio_ctx) = calculate_audio_ctx(duration_secs) {
                 params.set_audio_ctx(audio_ctx);
                 tracing::info!(
@@ -281,6 +354,7 @@ impl Transcriber for WhisperTranscriber {
             .ctx
             .create_state()
             .map_err(|e| TranscribeError::InferenceFailed(e.to_string()))?;
+        self.attach_npu(&mut state, duration_secs)?;
 
         // Determine language based on configuration mode
         let selected_language: Option<String> = if self.language.is_auto() {
@@ -356,6 +430,45 @@ fn is_degenerate_transcript(text: &str) -> bool {
     }
 
     !trimmed.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Bring up the NPU encoder for `config`, with the model file whisper.cpp
+/// loads (the encoder weights come from it too).
+#[cfg(feature = "xdna-npu")]
+fn load_npu_encoder(
+    config: &WhisperConfig,
+    model_path: &std::path::Path,
+) -> Result<super::xdna::XdnaEncoder, TranscribeError> {
+    let expand = |p: &str| -> PathBuf {
+        match p.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(p)),
+            None => PathBuf::from(p),
+        }
+    };
+    let model_name = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim_start_matches("ggml-").to_string())
+        .unwrap_or_else(|| config.model.clone());
+    let pack_dir = match &config.npu_pack {
+        Some(p) => expand(p),
+        None => super::xdna::find_pack(&model_name, None).ok_or_else(|| {
+            TranscribeError::InitFailed(format!(
+                "encoder_device = \"npu\": no kernel pack for {} in {}.\n  \
+                 Set [whisper] npu_pack to the pack directory (e.g. {}-xdna1-<id>).",
+                model_name,
+                Config::models_dir().join("npu-packs").display(),
+                model_name
+            ))
+        })?,
+    };
+    super::xdna::XdnaEncoder::load(&super::xdna::XdnaOptions {
+        pack_dir,
+        model_path: model_path.to_path_buf(),
+        shim_path: config.npu_shim.as_deref().map(expand),
+    })
 }
 
 /// Resolve model name to file path

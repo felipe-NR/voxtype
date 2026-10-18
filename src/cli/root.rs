@@ -146,6 +146,40 @@ pub struct Cli {
     #[arg(long, help_heading = "Whisper", hide_short_help = true)]
     pub flash_attention: bool,
 
+    /// Where the Whisper encoder runs: default (whisper.cpp) or npu (AMD XDNA)
+    #[arg(
+        long,
+        value_name = "DEVICE",
+        help_heading = "Whisper",
+        hide_short_help = true,
+        value_parser = ["default", "npu"],
+        long_help = "Where the Whisper encoder runs.\n\
+        default: whisper.cpp's own encoder (GPU or CPU, per build)\n\
+        npu: the AMD XDNA NPU (Ryzen AI); the decoder runs on the CPU.\n\
+        Needs a build with --features xdna-npu, a kernel pack (--npu-pack)\n\
+        and libvoxtype_xrt.so (--npu-shim). Example:\n  \
+        voxtype --encoder-device npu --npu-pack ~/npu-packs/large-v3-turbo-xdna1-5be736d256ac"
+    )]
+    pub encoder_device: Option<String>,
+
+    /// Kernel pack directory for --encoder-device npu
+    #[arg(
+        long,
+        value_name = "DIR",
+        help_heading = "Whisper",
+        hide_short_help = true
+    )]
+    pub npu_pack: Option<String>,
+
+    /// Path to libvoxtype_xrt.so for --encoder-device npu
+    #[arg(
+        long,
+        value_name = "PATH",
+        help_heading = "Whisper",
+        hide_short_help = true
+    )]
+    pub npu_shim: Option<String>,
+
     /// Whisper execution mode: local, remote, or cli
     #[arg(
         long,

@@ -267,6 +267,9 @@ cohere-tensorrt = ["cohere", "onnx-tensorrt-enabled"]
 onnx-load-dynamic = ["ort/load-dynamic"]
 # OpenVINO Whisper backend (Intel NPU/CPU/GPU via OpenVINO GenAI WhisperPipeline)
 openvino-whisper = ["dep:openvino-genai"]
+# Whisper encoder on the AMD XDNA NPU (Ryzen AI). No build-time dependency:
+# XRT is reached through libvoxtype_xrt.so (xdna-shim/), loaded at run time.
+xdna-npu = []
 
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -343,3 +346,8 @@ required-features = ["cohere"]
 # if needed) once that PR merges and ships in a crates.io release.
 [patch.crates-io]
 openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whisper-pipeline-with-properties" }
+# LOCAL ONLY (XDNA NPU encoder work): whisper.cpp 1.8.3 + whisper-rs 0.16.0
+# with a runtime encoder callback (whisper_set_encoder_callback). Checked out
+# next to this repository; not something a source build can resolve.
+whisper-rs = { path = "../whisper-rs-voxtype/whisper-rs" }
+whisper-rs-sys = { path = "../whisper-rs-voxtype/whisper-rs-sys" }
