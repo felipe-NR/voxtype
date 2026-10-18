@@ -346,8 +346,9 @@ required-features = ["cohere"]
 # if needed) once that PR merges and ships in a crates.io release.
 [patch.crates-io]
 openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whisper-pipeline-with-properties" }
-# LOCAL ONLY (XDNA NPU encoder work): whisper.cpp 1.8.3 + whisper-rs 0.16.0
-# with a runtime encoder callback (whisper_set_encoder_callback). Checked out
-# next to this repository; not something a source build can resolve.
-whisper-rs = { path = "../whisper-rs-voxtype/whisper-rs" }
-whisper-rs-sys = { path = "../whisper-rs-voxtype/whisper-rs-sys" }
+# TEMPORARY (XDNA NPU encoder): whisper-rs 0.16.0 / whisper-rs-sys 0.15.0
+# (whisper.cpp 1.8.3) plus a runtime encoder callback
+# (whisper_set_encoder_callback) and audio_ctx before language detection.
+# Drop once the callback is upstream in whisper.cpp and whisper-rs.
+whisper-rs = { git = "https://github.com/felipe-NR/whisper-rs-voxtype", rev = "0b7e4089a81abd43c02abdb2ee492fd546d0fb24" }
+whisper-rs-sys = { git = "https://github.com/felipe-NR/whisper-rs-voxtype", rev = "0b7e4089a81abd43c02abdb2ee492fd546d0fb24" }
