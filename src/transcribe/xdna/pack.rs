@@ -61,17 +61,36 @@ pub struct MemoryInfo {
     pub memlock_min_bytes: u64,
 }
 
+/// The kernel calling convention: `kernel(opcode, insts, n_insts, bufs...)`.
+/// Memory groups are not in here: XRT encodes a per-context number in their
+/// high 16 bits, so they are queried at run time.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Abi {
     pub opcode: u32,
-    pub insts_group_id: i32,
-    pub gemm: AbiKind,
-    pub rowop: AbiKind,
+    pub kernel_args: KernelArgs,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AbiKind {
-    pub group_ids: Vec<i32>,
+pub struct KernelArgs {
+    pub gemm: GemmArgs,
+    pub rowop: RowopArgs,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GemmArgs {
+    pub insts: i32,
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub struct RowopArgs {
+    pub insts: i32,
+    #[serde(rename = "in")]
+    pub input: i32,
+    pub out: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,6 +343,28 @@ impl Pack {
             errors.push(format!(
                 "pack_id {} is not the hash of its designs ({})",
                 m.pack_id, want_id
+            ));
+        }
+
+        // libvoxtype_xrt binds kernel(3, insts, n_insts, bufs...) at fixed
+        // argument positions; a pack built for another layout cannot run.
+        let gemm_ok = m.abi.kernel_args.gemm
+            == GemmArgs {
+                insts: 1,
+                a: 3,
+                b: 4,
+                c: 5,
+            };
+        let rowop_ok = m.abi.kernel_args.rowop
+            == RowopArgs {
+                insts: 1,
+                input: 3,
+                out: 4,
+            };
+        if m.abi.opcode != 3 || !gemm_ok || !rowop_ok {
+            errors.push(format!(
+                "kernel ABI {:?} (opcode {}) is not the one this voxtype drives",
+                m.abi.kernel_args, m.abi.opcode
             ));
         }
 

@@ -1,8 +1,9 @@
 //! NPU backend management for voxtype
 //!
-//! Manages Intel NPU acceleration via OpenVINO. Unlike GPU (which switches binaries
-//! via symlinks), NPU is config-driven: it sets `engine = "openvino"` in config.toml
-//! and uses the same binary compiled with the `openvino-whisper` feature.
+//! Intel NPUs run the OpenVINO engine: `engine = "openvino"`, with the binary
+//! compiled with the `openvino-whisper` feature. AMD XDNA NPUs (Ryzen AI) run
+//! the Whisper encoder through `[whisper] encoder_device = "npu"`, with the
+//! `xdna-npu` feature. Both are config-driven; unlike GPU, no binary switch.
 
 use crate::config::Config;
 use std::path::Path;
@@ -69,8 +70,16 @@ fn update_engine_in_config(content: &str, engine: &str) -> String {
     result
 }
 
+/// True when the NPU is an AMD XDNA one (the amdxdna driver is loaded).
+fn is_amd_xdna() -> bool {
+    Path::new("/sys/module/amdxdna").exists()
+}
+
 /// Show NPU hardware and configuration status
 pub fn show_status() {
+    if is_amd_xdna() {
+        return amd::show_status();
+    }
     println!("NPU Status\n");
 
     // Hardware detection
@@ -136,6 +145,9 @@ pub fn show_status() {
 
 /// Enable NPU acceleration
 pub fn enable() -> anyhow::Result<()> {
+    if is_amd_xdna() {
+        return amd::enable();
+    }
     #[cfg(not(feature = "openvino-whisper"))]
     {
         anyhow::bail!(
@@ -203,6 +215,9 @@ pub fn enable() -> anyhow::Result<()> {
 
 /// Disable NPU acceleration (revert to Whisper engine)
 pub fn disable() -> anyhow::Result<()> {
+    if is_amd_xdna() {
+        return amd::disable();
+    }
     if let Some(config_path) = Config::default_path() {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
@@ -224,6 +239,271 @@ pub fn disable() -> anyhow::Result<()> {
     println!("  systemctl --user restart voxtype");
 
     Ok(())
+}
+
+/// AMD XDNA (Ryzen AI): the Whisper encoder on the NPU, the decoder on the CPU.
+mod amd {
+    use crate::config::{Config, EncoderDevice};
+    use std::path::{Path, PathBuf};
+
+    fn read_sys(p: &str) -> Option<String> {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// "1022:1502" for the first accel device, if any.
+    fn pci_id() -> Option<String> {
+        let v = read_sys("/sys/class/accel/accel0/device/vendor")?;
+        let d = read_sys("/sys/class/accel/accel0/device/device")?;
+        Some(format!(
+            "{}:{}",
+            v.trim_start_matches("0x"),
+            d.trim_start_matches("0x")
+        ))
+    }
+
+    fn generation(pci: &str) -> &'static str {
+        match pci {
+            "1022:1502" => "XDNA1 (Phoenix / Hawk Point)",
+            "1022:17f0" => "XDNA2 (Strix / Krackan)",
+            _ => "unknown XDNA",
+        }
+    }
+
+    fn expand(p: &str) -> PathBuf {
+        match p.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(p)),
+            None => PathBuf::from(p),
+        }
+    }
+
+    /// The pack the configured model would use: npu_pack, else the newest
+    /// <model>-xdna* under <models dir>/npu-packs.
+    fn configured_pack(config: &Config) -> Option<PathBuf> {
+        if let Some(p) = &config.whisper.npu_pack {
+            return Some(expand(p));
+        }
+        let root = Config::models_dir().join("npu-packs");
+        let prefix = format!("{}-xdna", config.whisper.model);
+        let mut hits: Vec<PathBuf> = std::fs::read_dir(&root)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+                    && p.join("manifest.json").is_file()
+            })
+            .collect();
+        hits.sort();
+        hits.pop()
+    }
+
+    /// memlock_min_bytes from a pack's manifest, without validating the pack.
+    fn pack_memlock(pack: &Path) -> Option<u64> {
+        let text = std::fs::read_to_string(pack.join("manifest.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v["memory"]["memlock_min_bytes"].as_u64()
+    }
+
+    fn memlock_soft() -> Option<u64> {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } != 0 {
+            return None;
+        }
+        (lim.rlim_cur != libc::RLIM_INFINITY).then_some(lim.rlim_cur)
+    }
+
+    fn memlock_fix(need: u64) {
+        super::super::print_info(&format!(
+            "Raise it (as root), then log out and back in:\n         \
+             sudo mkdir -p /etc/systemd/system/user@.service.d\n         \
+             printf '[Service]\\nLimitMEMLOCK={}\\n' | sudo tee /etc/systemd/system/user@.service.d/voxtype-npu.conf\n         \
+             echo '* - memlock {}' | sudo tee /etc/security/limits.d/voxtype-npu.conf",
+            need,
+            need / 1024
+        ));
+    }
+
+    fn shim_path(config: &Config) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> =
+            config.whisper.npu_shim.iter().map(|p| expand(p)).collect();
+        if candidates.is_empty() {
+            if let Some(home) = dirs::home_dir() {
+                candidates.push(
+                    home.join(".local/lib/voxtype/xdna/lib/x86_64-linux-gnu/libvoxtype_xrt.so"),
+                );
+            }
+            candidates.push(PathBuf::from(
+                "/usr/lib/voxtype/xdna/lib/x86_64-linux-gnu/libvoxtype_xrt.so",
+            ));
+        }
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    pub fn show_status() {
+        use super::super::{print_failure, print_info, print_success, print_warning};
+        let config = crate::config::load_config(None).unwrap_or_default();
+        println!("NPU Status (AMD XDNA)\n");
+
+        println!("Hardware:");
+        match pci_id() {
+            Some(id) => print_success(&format!(
+                "{} at /dev/accel/accel0 [{}]",
+                generation(&id),
+                id
+            )),
+            None => print_failure("No accel device at /dev/accel/accel0"),
+        }
+        print_success("amdxdna kernel module loaded");
+
+        println!("\nBuild:");
+        if cfg!(feature = "xdna-npu") {
+            print_success("xdna-npu feature compiled in");
+        } else {
+            print_failure("xdna-npu feature not compiled");
+            print_info("Rebuild with --features xdna-npu");
+        }
+
+        println!("\nRuntime:");
+        match shim_path(&config) {
+            Some(p) => {
+                print_success(&format!("libvoxtype_xrt.so: {}", p.display()));
+                #[cfg(feature = "xdna-npu")]
+                match crate::transcribe::xdna::shim::Shim::load(Some(&p))
+                    .and_then(|s| s.xrt_version())
+                {
+                    Ok((a, b, c)) => print_success(&format!("XRT {}.{}.{}", a, b, c)),
+                    Err(e) => print_failure(&format!("cannot load the shim: {}", e)),
+                }
+            }
+            None => {
+                print_failure("libvoxtype_xrt.so not found");
+                print_info(
+                    "Build it: docker build -f xdna-shim/Dockerfile --output type=local,dest=$HOME/.local/lib/voxtype/xdna xdna-shim",
+                );
+            }
+        }
+
+        println!("\nKernel pack (model {}):", config.whisper.model);
+        let pack = configured_pack(&config);
+        match &pack {
+            Some(p) if p.join("manifest.json").is_file() => {
+                print_success(&format!("{}", p.display()));
+            }
+            Some(p) => print_failure(&format!("{}: no manifest.json", p.display())),
+            None => {
+                print_failure(&format!(
+                    "no pack for {} (set [whisper] npu_pack, or put it under {})",
+                    config.whisper.model,
+                    Config::models_dir().join("npu-packs").display()
+                ));
+            }
+        }
+
+        println!("\nLocked memory:");
+        let need = pack.as_deref().and_then(pack_memlock);
+        match (memlock_soft(), need) {
+            (None, _) => print_success("RLIMIT_MEMLOCK unlimited"),
+            (Some(lim), Some(need)) if lim >= need => print_success(&format!(
+                "RLIMIT_MEMLOCK {} MiB (the pack needs {} MiB)",
+                lim >> 20,
+                need >> 20
+            )),
+            (Some(lim), Some(need)) => {
+                print_warning(&format!(
+                    "RLIMIT_MEMLOCK {} KiB, the pack needs {} MiB: XRT cannot map its buffers",
+                    lim >> 10,
+                    need >> 20
+                ));
+                memlock_fix(need);
+            }
+            (Some(lim), None) => print_info(&format!("RLIMIT_MEMLOCK {} KiB", lim >> 10)),
+        }
+        print_info("Only one process can hold the NPU's hardware contexts at a time:\n         stop other NPU services (e.g. a speech-to-text container) while voxtype uses it.");
+
+        println!("\nConfiguration:");
+        if config.whisper.encoder_device == EncoderDevice::Npu {
+            print_success("[whisper] encoder_device = \"npu\"");
+        } else {
+            print_info("[whisper] encoder_device is not \"npu\" (run: voxtype setup npu --enable)");
+        }
+    }
+
+    pub fn enable() -> anyhow::Result<()> {
+        if !cfg!(feature = "xdna-npu") {
+            anyhow::bail!(
+                "AMD NPU support requires the xdna-npu feature.\n\
+                 Rebuild with: cargo build --release --features xdna-npu"
+            );
+        }
+        let config = crate::config::load_config(None).unwrap_or_default();
+        let path = Config::default_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine config path"))?;
+        let pack = configured_pack(&config).ok_or_else(|| {
+            anyhow::anyhow!(
+                "No kernel pack for model {}. Put one under {} or set [whisper] npu_pack.",
+                config.whisper.model,
+                Config::models_dir().join("npu-packs").display()
+            )
+        })?;
+        crate::config_set::set_key(path.clone(), "whisper.encoder_device", "npu")?;
+        super::super::print_success("Config updated: [whisper] encoder_device = \"npu\"");
+        if config.whisper.npu_pack.is_none() {
+            super::super::print_info(&format!("Kernel pack: {}", pack.display()));
+        }
+        if let (Some(lim), Some(need)) = (memlock_soft(), pack_memlock(&pack)) {
+            if lim < need {
+                super::super::print_warning(&format!(
+                    "RLIMIT_MEMLOCK is {} KiB; the NPU encoder needs {} MiB per buffer.",
+                    lim >> 10,
+                    need >> 20
+                ));
+                memlock_fix(need);
+            }
+        }
+        println!();
+        println!("Restart voxtype to apply:");
+        println!("  systemctl --user restart voxtype");
+        Ok(())
+    }
+
+    pub fn disable() -> anyhow::Result<()> {
+        let path = Config::default_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine config path"))?;
+        crate::config_set::set_key(path, "whisper.encoder_device", "default")?;
+        super::super::print_success("Config updated: [whisper] encoder_device = \"default\"");
+        println!();
+        println!("Restart voxtype to apply:");
+        println!("  systemctl --user restart voxtype");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn generation_from_pci_id() {
+            assert!(generation("1022:1502").starts_with("XDNA1"));
+            assert!(generation("1022:17f0").starts_with("XDNA2"));
+            assert_eq!(generation("8086:7d1d"), "unknown XDNA");
+        }
+
+        #[test]
+        fn reads_memlock_from_manifest() {
+            let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/xdna/large-v3-turbo-xdna1-5be736d256ac");
+            assert_eq!(pack_memlock(&pack), Some(134_217_728));
+        }
+    }
 }
 
 #[cfg(test)]

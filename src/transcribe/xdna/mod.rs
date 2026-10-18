@@ -367,14 +367,49 @@ mod device_tests {
         let enc = XdnaEncoder::load(&opts).expect("load");
         let (shape, mel) = host::read_npy_f32(&fixtures.join("mel.npy"));
         assert_eq!(shape, vec![80, 1024]);
+        let repeats: usize = std::env::var("VOXTYPE_XDNA_REPEAT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for _ in 1..repeats {
+            let mut inner = enc.inner.lock().unwrap();
+            inner.enc.taps = Some(Vec::new());
+            inner.enc.encode(&mel, 512).expect("encode");
+            for (name, got) in inner.enc.taps.take().unwrap() {
+                if name.starts_with('l') {
+                    continue;
+                }
+                let (_, want) = host::read_npy_f32(&fixtures.join(format!("{}.npy", name)));
+                let max_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                eprint!("{} {:.6}  ", name, max_abs);
+            }
+            eprintln!();
+        }
         let out = {
             let mut inner = enc.inner.lock().unwrap();
             inner.enc.taps = Some(Vec::new());
             let out = inner.enc.encode(&mel, 512).expect("encode");
             for (name, got) in inner.enc.taps.take().unwrap() {
+                if let Ok(dir) = std::env::var("VOXTYPE_XDNA_DUMP") {
+                    let bytes: Vec<u8> = got.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(PathBuf::from(dir).join(format!("{}.f32", name)), bytes)
+                        .unwrap();
+                }
+                if name.starts_with('l') {
+                    continue;
+                }
                 let (_, want) = host::read_npy_f32(&fixtures.join(format!("{}.npy", name)));
                 let c = cosine(&got, &want);
-                eprintln!("{}: cosine {:.6}", name, c);
+                let max_abs = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                eprintln!("{}: cosine {:.8}, max |err| {:.6}", name, c, max_abs);
                 assert!(c > 0.999, "{}: cosine {}", name, c);
             }
             out

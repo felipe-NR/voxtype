@@ -1,7 +1,7 @@
 {
  "schema": "xdna-whisper-pack/1",
  "pack_id": "large-v3-turbo-xdna1-5be736d256ac",
- "created": "2026-10-18T07:29:11Z",
+ "created": "2026-10-18T08:55:47Z",
  "model": {
   "name": "large-v3-turbo",
   "n_mels": 128,
@@ -44,7 +44,7 @@
   "mlir_aie": "1.3.4",
   "peano": "21.0.0.2026062301+cb664e8c",
   "xrt_built": "1:2.25.0-4~bpo13+1",
-  "whisper_xdna": "da013694bcbb58f6a326f8a3272267bba9e55f67"
+  "whisper_xdna": "3359798cafe4f1cc8663de00723d68b9af5d1db4"
  },
  "memory": {
   "heap_bytes": 67108864,
@@ -54,30 +54,68 @@
  },
  "abi": {
   "opcode": 3,
-  "insts_group_id": 1,
-  "gemm": {
-   "buffers": [
-    "a",
-    "b",
-    "c"
-   ],
-   "group_ids": [
-    3,
-    4,
-    5
-   ]
+  "kernel_args": {
+   "gemm": {
+    "insts": 1,
+    "a": 3,
+    "b": 4,
+    "c": 5
+   },
+   "rowop": {
+    "insts": 1,
+    "in": 3,
+    "out": 4
+   }
   },
-  "rowop": {
-   "buffers": [
-    "in",
-    "out"
-   ],
-   "group_ids": [
-    3,
-    4
-   ]
-  },
-  "group_ids_are": "assertions: query kernel.group_id(i) at run time and refuse on mismatch"
+  "memory_groups": "query kernel.group_id(arg_index) on the kernel a BO feeds, at run time: the value changes with every hw_context (high 16 bits); memory_groups_observed records only the low 16 bits seen at export, for reference",
+  "memory_groups_observed": {
+   "gemm": {
+    "insts": {
+     "low16": [
+      1
+     ],
+     "distinct_values": 30
+    },
+    "a": {
+     "low16": [
+      0
+     ],
+     "distinct_values": 30
+    },
+    "b": {
+     "low16": [
+      0
+     ],
+     "distinct_values": 30
+    },
+    "c": {
+     "low16": [
+      0
+     ],
+     "distinct_values": 30
+    }
+   },
+   "rowop": {
+    "insts": {
+     "low16": [
+      1
+     ],
+     "distinct_values": 15
+    },
+    "in": {
+     "low16": [
+      0
+     ],
+     "distinct_values": 15
+    },
+    "out": {
+     "low16": [
+      0
+     ],
+     "distinct_values": 15
+    }
+   }
+  }
  },
  "encoder_output": {
   "rows": "ctx (padding stripped)",
@@ -2071,7 +2109,7 @@
   }
  },
  "verified": {
-  "date": "2026-10-18T07:29:11Z",
+  "date": "2026-10-18T08:55:47Z",
   "designs_match_ladder": true
  }
 }

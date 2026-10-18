@@ -220,16 +220,20 @@ impl GgmlEncoder {
             .map_err(|e| err(&self.path, format!("{}: {}", key, e)))?;
         Ok(match info.ttype {
             TensorType::F32 => raw
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             TensorType::F16 => raw
-                .chunks_exact(2)
-                .map(|b| f16_to_f32(u16::from_le_bytes(b.try_into().unwrap())))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f16_to_f32(u16::from_le_bytes(*b)))
                 .collect(),
             TensorType::Q8_0 => {
                 let mut out = Vec::with_capacity(n);
-                for block in raw.chunks_exact(2 + QK8_0) {
+                for block in raw.as_chunks::<{ 2 + QK8_0 }>().0 {
                     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
                     out.extend(block[2..].iter().map(|&q| d * (q as i8) as f32));
                 }

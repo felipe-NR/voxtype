@@ -18,10 +18,6 @@ struct Overlay {
     xclbin: super::shim::Xclbin,
     kernel_name: String,
     words: Vec<u32>,
-    /// Uploaded the first time a context opens the overlay, in the memory
-    /// group its kernel reports for the instruction argument.
-    insts: Option<Bo>,
-    gemm: bool,
 }
 
 /// Runlists bound to one context's kernel, for one set of step buffers.
@@ -37,6 +33,9 @@ struct Live {
     // Field order is drop order: runs and runlists, then the kernel, then
     // the context they keep alive.
     runlist: Option<BoundRunlist>,
+    /// The instruction stream, uploaded per context in the memory group
+    /// this context's kernel reports (the group carries the context number).
+    insts: Bo,
     kernel: Kernel,
     _ctx: HwCtx,
 }
@@ -54,6 +53,21 @@ pub struct Runtime {
 
 fn fail(msg: impl std::fmt::Display) -> TranscribeError {
     TranscribeError::InferenceFailed(format!("NPU: {}", msg))
+}
+
+/// The NPU's hw_context slots are device-wide: a context creation that fails
+/// with EINVAL when this process holds fewer than the limit means another
+/// process (the whisper-xdna service, a second voxtype) holds the rest.
+fn busy_hint(e: TranscribeError) -> TranscribeError {
+    let msg = e.to_string();
+    if !msg.contains("err=-22") {
+        return e;
+    }
+    TranscribeError::InferenceFailed(format!(
+        "{}\n  The NPU has no free hardware context. Another process is probably using it\n  \
+         (e.g. an NPU speech-to-text container, or a second voxtype daemon); stop it and retry.",
+        msg
+    ))
 }
 
 impl Runtime {
@@ -77,23 +91,28 @@ impl Runtime {
                 return Err(fail(format!("{}: not a uint32 stream", d.insts.path)));
             }
             let words: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect();
             loaded.push((name, xclbin, kernel_name, words, d.kind == "gemm"));
         }
 
-        // XRT encodes memory groups (65536 for a kernel's argument 3, not the
-        // 3 the manifest lists), so operand buffers are allocated in the
-        // groups one kernel of each kind reports. A host_only buffer is not
-        // tied to that kernel: it feeds kernels of other overlays too
-        // (measured in whisper-xdna, probe_bo_share.py).
+        // A memory group from kernel.group_id() is (context number << 16) |
+        // bank, so no value is valid for every context. Operand buffers are
+        // host_only and outlive the contexts that use them, and a host_only
+        // buffer allocated against one kernel feeds kernels of other overlays
+        // and contexts with correct results (measured in whisper-xdna:
+        // attention stacks, resident weights). So they are allocated in the
+        // groups one kernel of each kind reports here; only the instruction
+        // buffers, which are cacheable, use their own kernel's group.
         let probe = |gemm: bool, n: usize| -> Result<Vec<i32>, TranscribeError> {
             let (name, xclbin, kernel_name, ..) = loaded
                 .iter()
                 .find(|l| l.4 == gemm)
                 .ok_or_else(|| fail("the pack has no design of a required kind"))?;
-            let ctx = dev.hwctx(xclbin)?;
+            let ctx = dev.hwctx(xclbin).map_err(busy_hint)?;
             let k = ctx.kernel(kernel_name)?;
             let groups = (0..n)
                 .map(|i| k.group_id(3 + i as i32))
@@ -101,20 +120,18 @@ impl Runtime {
             tracing::debug!("NPU: {} memory groups {:?}", name, groups);
             Ok(groups)
         };
-        let gemm_groups = probe(true, m.abi.gemm.group_ids.len())?;
-        let rowop_groups = probe(false, m.abi.rowop.group_ids.len())?;
+        let gemm_groups = probe(true, 3)?;
+        let rowop_groups = probe(false, 2)?;
 
         let overlays = loaded
             .into_iter()
-            .map(|(name, xclbin, kernel_name, words, gemm)| {
+            .map(|(name, xclbin, kernel_name, words, _)| {
                 (
                     name,
                     Overlay {
                         xclbin,
                         kernel_name,
                         words,
-                        insts: None,
-                        gemm,
                     },
                 )
             })
@@ -158,23 +175,21 @@ impl Runtime {
         }
         let ov = self
             .overlays
-            .get_mut(name)
+            .get(name)
             .ok_or_else(|| fail(format!("design {} not loaded", name)))?;
-        let ctx = self.dev.hwctx(&ov.xclbin)?;
+        let ctx = self.dev.hwctx(&ov.xclbin).map_err(busy_hint)?;
         let kernel = ctx.kernel(&ov.kernel_name)?;
-        if ov.insts.is_none() {
-            let mut insts =
-                self.dev
-                    .alloc(ov.words.len() * 4, BO_CACHEABLE, kernel.group_id(1)?)?;
-            insts.as_u32_mut().copy_from_slice(&ov.words);
-            insts.to_device()?;
-            ov.insts = Some(insts);
-        }
+        let mut insts = self
+            .dev
+            .alloc(ov.words.len() * 4, BO_CACHEABLE, kernel.group_id(1)?)?;
+        insts.as_u32_mut().copy_from_slice(&ov.words);
+        insts.to_device()?;
         self.ctx_creates += 1;
         self.live.push(Live {
             name: name.to_string(),
             last: self.clock,
             runlist: None,
+            insts,
             kernel,
             _ctx: ctx,
         });
@@ -184,9 +199,12 @@ impl Runtime {
     /// Start kernel(3, insts, n_insts, bufs...) on `name`'s overlay.
     pub fn start(&mut self, name: &str, bufs: &[&Bo]) -> Result<Run, TranscribeError> {
         let i = self.slot(name)?;
-        let ov = &self.overlays[name];
-        let insts = ov.insts.as_ref().expect("uploaded when the context opened");
-        self.live[i].kernel.start(insts, ov.words.len(), bufs)
+        if let Some(out) = bufs.last() {
+            out.flush_head();
+        }
+        let n = self.overlays[name].words.len();
+        let live = &self.live[i];
+        live.kernel.start(&live.insts, n, bufs)
     }
 
     /// Run and wait.
@@ -206,13 +224,12 @@ impl Runtime {
         let fresh = !matches!(&self.live[i].runlist, Some(b) if b.step_ctx == step_ctx);
         if fresh {
             self.live[i].runlist = None;
-            let ov = &self.overlays[name];
-            let insts = ov.insts.as_ref().expect("uploaded when the context opened");
+            let n = self.overlays[name].words.len();
             let live = &self.live[i];
             let list = live._ctx.runlist()?;
             let mut runs = Vec::with_capacity(args.len());
             for a in args {
-                let r = live.kernel.bind(insts, ov.words.len(), a)?;
+                let r = live.kernel.bind(&live.insts, n, a)?;
                 list.add(&r)?;
                 runs.push(r);
             }
@@ -221,6 +238,9 @@ impl Runtime {
                 list,
                 _runs: runs,
             });
+        }
+        for a in args {
+            a[2].flush_head();
         }
         self.live[i].runlist.as_ref().unwrap().list.execute()
     }

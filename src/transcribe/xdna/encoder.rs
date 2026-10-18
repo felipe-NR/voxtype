@@ -92,7 +92,7 @@ pub struct Encoder {
     dev_w: Vec<LayerDev>,
     bufs: Option<StepBufs>,
     /// When set, encode() records the stages the fixtures pin down.
-    pub taps: Option<Vec<(&'static str, Vec<f32>)>>,
+    pub taps: Option<Vec<(String, Vec<f32>)>>,
 }
 
 /// The padded B operand of `x @ W.T`, for W stored (out, in) row-major:
@@ -137,6 +137,7 @@ fn upload_b(
 fn zeroed(rt: &Runtime, bytes: usize, group: i32) -> Result<Bo, TranscribeError> {
     let mut bo = rt.dev.alloc(bytes, BO_HOST_ONLY, group)?;
     bo.as_u16_mut().fill(0);
+    bo.to_device()?;
     Ok(bo)
 }
 
@@ -474,7 +475,7 @@ impl Encoder {
         add_row(&mut x, &self.conv1_b);
         Self::gelu(rt, &step, &mut bufs.gelu_in, &bufs.gelu_out, &mut x)?;
         if let Some(t) = &mut self.taps {
-            t.push(("conv1_gelu", x.clone()));
+            t.push(("conv1_gelu".into(), x.clone()));
         }
         let a2 = im2col(&transpose(&x, frames, d), d, frames, 3, 2, 1);
         let mut x = Self::gemm(
@@ -506,7 +507,7 @@ impl Encoder {
         for l in 0..self.n_layer {
             if let Some(t) = &mut self.taps {
                 if l < 2 {
-                    t.push((["block0_in", "block1_in"][l], x.clone()));
+                    t.push((["block0_in", "block1_in"][l].into(), x.clone()));
                 }
             }
             let hp = &self.host[l];
@@ -524,19 +525,23 @@ impl Encoder {
                 Some(d),
             );
             bufs.proj_a.to_device()?;
-            let runs = [
-                rt.start(&r.proj.design, &[&bufs.proj_a, &w.q, &bufs.proj_c[0]])?,
-                rt.start(&r.proj.design, &[&bufs.proj_a, &w.k, &bufs.proj_c[1]])?,
-                rt.start(&r.proj.design, &[&bufs.proj_a, &w.v, &bufs.proj_c[2]])?,
-            ];
-            for run in &runs {
-                run.wait(RUN_TIMEOUT_MS, "qkv")?;
+            for (wb, c) in [&w.q, &w.k, &w.v].into_iter().zip(&bufs.proj_c) {
+                rt.run(&r.proj.design, &[&bufs.proj_a, wb, c])?;
             }
-            drop(runs);
             for c in &bufs.proj_c[..3] {
                 c.from_device()?;
             }
             let proj_np = r.proj.np;
+            {
+                if let Some(t) = &mut self.taps {
+                    for (name, c) in ["q", "k", "v"].iter().zip(&bufs.proj_c) {
+                        t.push((
+                            format!("l{}_{}", l, name),
+                            unpad_f32(c.as_f32(), proj_np, ctx, d),
+                        ));
+                    }
+                }
+            }
             let (qc, kc, vc) = (
                 bufs.proj_c[0].as_f32(),
                 bufs.proj_c[1].as_f32(),
@@ -600,6 +605,11 @@ impl Encoder {
                 }
             }
 
+            {
+                if let Some(t) = &mut self.taps {
+                    t.push((format!("l{}_o", l), o.clone()));
+                }
+            }
             let y = Self::gemm(
                 rt,
                 &r.proj,
@@ -613,6 +623,11 @@ impl Encoder {
                 true,
             )?;
             add_into(&mut x, &y);
+            {
+                if let Some(t) = &mut self.taps {
+                    t.push((format!("l{}_x_attn", l), x.clone()));
+                }
+            }
 
             let h = layer_norm(&x, d, &hp.mlp_ln_w, &hp.mlp_ln_b);
             let y = if let Some(g) = &r.fc1_gelu {
@@ -667,7 +682,17 @@ impl Encoder {
                     false,
                 )?;
                 add_row(&mut f, &hp.fc1_b);
+                {
+                    if let Some(t) = &mut self.taps {
+                        t.push((format!("l{}_fc1", l), f.clone()));
+                    }
+                }
                 Self::gelu(rt, &step, &mut bufs.gelu_in, &bufs.gelu_out, &mut f)?;
+                {
+                    if let Some(t) = &mut self.taps {
+                        t.push((format!("l{}_gelu", l), f.clone()));
+                    }
+                }
                 Self::gemm(
                     rt,
                     &r.fc2,
@@ -682,6 +707,11 @@ impl Encoder {
                 )?
             };
             add_into(&mut x, &y);
+            {
+                if let Some(t) = &mut self.taps {
+                    t.push((format!("l{}_x_out", l), x.clone()));
+                }
+            }
             add_row(&mut x, &hp.fc2_b);
         }
 

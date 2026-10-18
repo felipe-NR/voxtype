@@ -135,7 +135,7 @@ pub enum SetupAction {
         status: bool,
     },
 
-    /// Manage Intel NPU acceleration through OpenVINO
+    /// Manage NPU acceleration (Intel via OpenVINO, AMD XDNA via the Whisper encoder)
     Npu {
         /// Enable NPU acceleration and configure OpenVINO
         #[arg(long)]

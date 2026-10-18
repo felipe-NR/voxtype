@@ -471,10 +471,6 @@ impl Bo {
         Bo::wrap(&self.shim, p, size)
     }
 
-    pub fn len(&self) -> usize {
-        self.size
-    }
-
     pub fn as_u16_mut(&mut self) -> &mut [u16] {
         unsafe { std::slice::from_raw_parts_mut(self.map as *mut u16, self.size / 2) }
     }
@@ -503,5 +499,23 @@ impl Bo {
             unsafe { (self.shim.fns.vxrt_bo_sync)(self.ptr, SYNC_FROM_DEVICE, self.size, 0) },
             "sync from device",
         )
+    }
+
+    /// Evict the first page of this buffer from the CPU caches. Done on every
+    /// output buffer before a launch: without it the first cache line of a
+    /// result sometimes keeps what the previous launch wrote there (seen on
+    /// XDNA1 with XRT 2.25 as 64 stale bytes at offset 0, never elsewhere;
+    /// a sync after the run does not clear it, a flush before it does).
+    pub fn flush_head(&self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let n = self.size.min(4096);
+            let mut off = 0;
+            while off < n {
+                std::arch::x86_64::_mm_clflush(self.map.add(off));
+                off += 64;
+            }
+            std::arch::x86_64::_mm_mfence();
+        }
     }
 }
