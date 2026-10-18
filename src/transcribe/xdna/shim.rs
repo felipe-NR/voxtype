@@ -506,6 +506,10 @@ impl Bo {
     /// result sometimes keeps what the previous launch wrote there (seen on
     /// XDNA1 with XRT 2.25 as 64 stale bytes at offset 0, never elsewhere;
     /// a sync after the run does not clear it, a flush before it does).
+    /// Root cause unknown: pyxrt driving the same XRT does not reproduce it.
+    /// Untested lead: the CPU's adjacent-line prefetcher pulling line 0 in
+    /// from a neighbouring buffer the host touches; a guard page in front of
+    /// each output buffer would show whether the failure moves.
     pub fn flush_head(&self) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
